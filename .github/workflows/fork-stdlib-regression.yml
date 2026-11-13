@@ -1,0 +1,39 @@
+name: Fork stdlib regression
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [sync/upstream-main-2026-11-12]
+
+permissions:
+  contents: read
+
+jobs:
+  source-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Run unit regressions with an empty temporary user home
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          test_home="$RUNNER_TEMP/usage-pulse-test-home"
+          mkdir -p "$test_home"
+          # CLI tests call main(), which intentionally changes process-global SIGPIPE.
+          # Isolate modules as their documented direct invocation does; run every file.
+          failed=0
+          for test_file in tests/test_*.py; do
+            HOME="$test_home" USERPROFILE="$test_home" \
+              XDG_CONFIG_HOME="$test_home/config" XDG_CACHE_HOME="$test_home/cache" \
+              python -m unittest discover -s tests -p "$(basename "$test_file")" -v || failed=1
+          done
+          exit "$failed"
