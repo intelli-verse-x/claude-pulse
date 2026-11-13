@@ -14,7 +14,9 @@ spill into Claude Code's notification area.  Three things are pinned here:
 Run: ``python tests/test_rendering.py``
 """
 import sys
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -23,6 +25,15 @@ sys.path.insert(0, str(REPO_ROOT))
 import claude_status as cs  # noqa: E402
 
 URL = "https://github.com/owner/repo/pull/1234"
+
+
+class _UsageApiReached(BaseException):
+    """A BaseException, so no ``except Exception`` in the render path can
+    swallow it and let a test pass after quietly calling the real usage API."""
+
+
+def _no_usage_api(*args, **kwargs):
+    raise _UsageApiReached("a test reached the real usage API")
 
 
 class VisibleLenTest(unittest.TestCase):
@@ -136,9 +147,24 @@ class RefreshIntervalTest(unittest.TestCase):
             cs._desired_refresh_interval({"animate": "rainbow"}), cs.REFRESH_ANIMATED
         )
 
-    def test_time_based_widget_gets_the_slow_tick(self):
+    def test_live_heartbeat_gets_the_slow_tick(self):
+        """A timer is warranted only once the widget is actually on screen."""
         cfg = {"animate": "off", "show": {"heartbeat": True, "pomodoro": False}}
-        self.assertEqual(cs._desired_refresh_interval(cfg), cs.REFRESH_TIMED)
+        with mock.patch.object(cs, "_read_hook_state", return_value={"tool_count": 1}),              mock.patch.object(cs, "_is_hook_state_fresh", return_value=True):
+            self.assertEqual(cs._desired_refresh_interval(cfg), cs.REFRESH_TIMED)
+
+    def test_running_focus_timer_gets_the_slow_tick(self):
+        cfg = {"animate": "off", "show": {"heartbeat": False, "pomodoro": True}}
+        with mock.patch.object(cs, "_read_pomodoro", return_value={"active": True}):
+            self.assertEqual(cs._desired_refresh_interval(cfg), cs.REFRESH_TIMED)
+
+    def test_enabled_but_idle_widgets_need_no_timer(self):
+        """Regression: heartbeat and pomodoro are on by default but render
+        nothing while idle. Asking for a timer on the setting alone relaunched
+        Python every 15s — 240 times an hour — to redraw an unchanged bar."""
+        cfg = {"animate": "off", "show": {"heartbeat": True, "pomodoro": True}}
+        with mock.patch.object(cs, "_is_hook_state_fresh", return_value=False),              mock.patch.object(cs, "_read_pomodoro", return_value=None):
+            self.assertIsNone(cs._desired_refresh_interval(cfg))
 
     def test_static_bar_needs_no_timer(self):
         cfg = {"animate": "off", "show": {"heartbeat": False, "pomodoro": False}}
@@ -194,6 +220,29 @@ class CorruptStateResilienceTest(unittest.TestCase):
                 p.write_text(junk, encoding="utf-8")
                 self.assertIsNone(cs.read_cache(p, 60), junk)
 
+    def test_read_cache_treats_an_out_of_range_timestamp_as_a_miss(self):
+        """An int too big for a float made float() raise OverflowError, which
+        the ValueError handlers miss, so main() died before drawing anything.
+        Infinity read as fresh, or as a backoff, forever."""
+        import tempfile
+        import time
+        huge = "1" + "0" * 400
+        hour_ago = repr(time.time() - 3600)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "c.json"
+            for junk in ('{"timestamp": %s, "usage": {}}' % huge,
+                         '{"timestamp": -%s, "usage": {}}' % huge,
+                         '{"timestamp": Infinity, "usage": {}}',
+                         '{"timestamp": NaN, "usage": {}}',
+                         '{"timestamp": "1e999", "usage": {}}',
+                         '{"rate_limited_until": %s, "timestamp": %s, "usage": {}}'
+                         % (huge, hour_ago),
+                         '{"rate_limited_until": Infinity, "timestamp": %s, "usage": {}}'
+                         % hour_ago):
+                with self.subTest(cache=junk[:60]):
+                    p.write_text(junk, encoding="utf-8")
+                    self.assertIsNone(cs.read_cache(p, 60))
+
     def test_write_cache_survives_non_dict_usage(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
@@ -217,6 +266,45 @@ class CorruptStateResilienceTest(unittest.TestCase):
         self.assertEqual(cs._cache_age({"timestamp": "bad"}), float("inf"))
         self.assertEqual(cs._cache_age([]), float("inf"))
         self.assertLess(cs._cache_age({"timestamp": __import__("time").time()}), 5)
+
+    def test_cache_age_of_out_of_range_timestamp_is_infinite(self):
+        """float() raises OverflowError, not ValueError, for an int beyond the
+        float range; and an infinite timestamp gives an age of -inf, which
+        reads as fresh forever. Both are as unusable as "bad"."""
+        for ts in (10 ** 400, -10 ** 400, float("inf"), float("-inf"),
+                   float("nan"), "1e999", "inf", "nan"):
+            with self.subTest(timestamp=ts):
+                self.assertEqual(cs._cache_age({"timestamp": ts}), float("inf"))
+
+    def test_cache_readers_treat_an_unparseable_file_as_a_miss(self):
+        """read_cache and _read_stale_cache run on every repaint but caught
+        JSON syntax errors and OSError only. Not UTF-8 (UnicodeDecodeError),
+        nested past the parser's depth (RecursionError), or an int past the
+        int/str digit limit (a plain ValueError on Python 3.11+ and the
+        3.8.14 / 3.9.14 / 3.10.7 security releases) raised instead."""
+        import tempfile
+        usage = b'"usage": {"five_hour": {"utilization": 1.0}}'
+        try:
+            int("9" * 5000)
+            digit_limit = False  # an interpreter from before CVE-2020-10735
+        except ValueError:
+            digit_limit = True
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "c.json"
+            for label, raw in (
+                    ("not utf-8", b'{"line": "\xff\xfe", ' + usage + b"}"),
+                    ("nested too deep", b"[" * 100000 + b"]" * 100000),
+                    ("int past the digit limit",
+                     b'{"timestamp": 1' + b"0" * 5000 + b", " + usage + b"}")):
+                with self.subTest(cache=label):
+                    p.write_bytes(raw)
+                    self.assertIsNone(cs.read_cache(p, 60))
+                    stale = cs._read_stale_cache(p)
+                    if label == "int past the digit limit" and not digit_limit:
+                        # It parses there; _cache_age then reads it as stale.
+                        self.assertIsInstance(stale, dict)
+                    else:
+                        self.assertIsNone(stale)
 
 
 class CsiGrammarTest(unittest.TestCase):
@@ -280,6 +368,178 @@ class EffortFormatTest(unittest.TestCase):
     def test_invalid_format_falls_back_to_default(self):
         self.assertEqual(cs._format_effort("medium", "bogus"),
                          cs._format_effort("medium", cs.DEFAULT_EFFORT_FORMAT))
+
+
+class PrBadgeMarkerTest(unittest.TestCase):
+    """GitLab merge requests are written !N; GitHub pull requests #N."""
+
+    def _badge_line(self, stdin_ctx):
+        import os
+        import tempfile
+        cfg = {"show": {"pr": True}}
+        with tempfile.TemporaryDirectory() as td:
+            # The state dir lives under LOCALAPPDATA / XDG_CACHE_HOME, not
+            # CLAUDE_CONFIG_DIR — all three must point at the sandbox or the
+            # test reads and writes the developer's real bar state.
+            env = {"CLAUDE_CONFIG_DIR": td, "LOCALAPPDATA": td,
+                   "XDG_CACHE_HOME": td}
+            with mock.patch.dict(os.environ, env):
+                return cs.build_status_line({}, "", cfg, stdin_ctx)
+
+    def test_github_pr_renders_hash(self):
+        line = self._badge_line({"pr_number": 42})
+        self.assertIn("#42", line)
+
+    def test_gitlab_mr_renders_bang(self):
+        line = self._badge_line({"pr_number": 42, "pr_kind": "mr"})
+        self.assertIn("!42", line)
+        self.assertNotIn("#42", line)
+
+
+class RefreshSyncTransitionsTest(unittest.TestCase):
+    """Every transition that changes whether a repaint timer is needed must
+    re-evaluate `refreshInterval`; a missed one leaves a stale 15s timer
+    armed (or a live countdown frozen) until some unrelated event syncs it."""
+
+    def test_hook_refresh_resyncs_the_timer(self):
+        import io
+        import tempfile
+        stdin = io.StringIO("")  # isatty() is False; empty JSON payload
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(cs, "sync_status_line_refresh") as sync, \
+                    mock.patch.object(
+                        cs, "_get_hook_state_path",
+                        return_value=Path(td) / "hook_state.json"), \
+                    mock.patch.object(sys, "stdin", stdin):
+                cs.hook_refresh("Bash")
+            self.assertTrue(sync.called)
+
+    def test_hook_refresh_syncs_after_persisting_the_state(self):
+        """The sync decides by re-reading the persisted hook state, so it
+        must run after the write — syncing first judges a just-woken
+        heartbeat by its stale on-disk timestamp and leaves the timer
+        unarmed until some other repaint happens along."""
+        import io
+        import tempfile
+        order = []
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                        cs, "sync_status_line_refresh",
+                        side_effect=lambda *a, **k: order.append("sync")), \
+                    mock.patch.object(
+                        cs, "_atomic_json_write",
+                        side_effect=lambda *a, **k: order.append("write")), \
+                    mock.patch.object(
+                        cs, "_get_hook_state_path",
+                        return_value=Path(td) / "hook_state.json"), \
+                    mock.patch.object(sys, "stdin", io.StringIO("")):
+                cs.hook_refresh("Bash")
+        self.assertEqual(order, ["write", "sync"])
+
+    def test_cmd_pomodoro_resyncs_on_every_path(self):
+        with mock.patch.object(cs, "sync_status_line_refresh") as sync, \
+                mock.patch.object(cs, "_cmd_pomodoro_inner", return_value=None):
+            cs.cmd_pomodoro("start")
+        self.assertTrue(sync.called)
+
+        with mock.patch.object(cs, "sync_status_line_refresh") as sync, \
+                mock.patch.object(cs, "_cmd_pomodoro_inner",
+                                  side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                cs.cmd_pomodoro("start")
+        self.assertTrue(sync.called)
+
+    def test_pomodoro_expiry_drops_the_timer(self):
+        """A focus timer that runs out on its own leaves the screen without
+        any command running — the render path itself must drop the timer."""
+        expired = {"active": True, "start": 1.0, "duration_minutes": 1}
+        with mock.patch.object(cs, "sync_status_line_refresh") as sync, \
+                mock.patch.object(cs, "_write_pomodoro") as write:
+            out = cs._render_pomodoro(expired, cs.THEMES["default"])
+        self.assertEqual(out, "")
+        self.assertTrue(write.called)
+        self.assertTrue(sync.called)
+
+    def _render_once(self, fetch=_no_usage_api):
+        """One status-line repaint with no credentials, as its own process;
+        returns the mock standing in for sync_status_line_refresh.
+
+        Nothing outside the temp dir is read: the config (XDG_CONFIG_HOME, or
+        ~/.config on Linux/macOS) and the home dir (other ``~/.claude-*``
+        accounts and providers) are redirected too, and the usage API raises
+        unless a test hands in its own ``fetch``."""
+        import io
+        import os
+        import tempfile
+        fake_stdout = mock.Mock()
+        fake_stdout.buffer = io.BytesIO()
+        tty_stdin = mock.Mock()
+        tty_stdin.isatty.return_value = True
+        passthrough = lambda line, *a, **k: line
+        with tempfile.TemporaryDirectory() as td:
+            # Sandbox the state dir too (LOCALAPPDATA / XDG_CACHE_HOME), so
+            # the run cannot touch — or be satisfied by — real bar state
+            # such as an expired pomodoro syncing from the render widget.
+            env = {"CLAUDE_CONFIG_DIR": td, "LOCALAPPDATA": td,
+                   "XDG_CACHE_HOME": td, "XDG_CONFIG_HOME": td,
+                   "HOME": td, "USERPROFILE": td}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(sys, "argv", ["claude_status.py"]), \
+                    mock.patch.object(sys, "stdin", tty_stdin), \
+                    mock.patch.object(sys, "stdout", fake_stdout), \
+                    mock.patch.object(cs, "fetch_usage", fetch), \
+                    mock.patch.object(cs, "sync_status_line_refresh",
+                                      return_value=False) as sync, \
+                    mock.patch.object(cs, "get_credentials",
+                                      return_value=(None, "")), \
+                    mock.patch.object(cs, "append_update_indicator",
+                                      side_effect=passthrough), \
+                    mock.patch.object(cs, "append_claude_update_indicator",
+                                      side_effect=passthrough):
+                cs.main()
+        return sync
+
+    def test_status_line_render_self_heals_the_timer(self):
+        """The heartbeat ageing past its TTL is observed by nothing but the
+        repaints themselves, so the render path re-syncs on every run."""
+        sync = self._render_once()
+        # The self-heal call is the one that passes the loaded config as an
+        # argument; widget-level calls take none. Asserting on the args pins
+        # this to the top-of-render sync specifically.
+        self.assertTrue(any(c.args for c in sync.call_args_list))
+
+    def test_render_run_ignores_the_contributors_own_posix_home(self):
+        """On Linux/macOS the config lives under XDG_CONFIG_HOME or ~/.config,
+        which the render run did not redirect: a contributor with a second
+        Claude account in their config had its token sent to the usage API on
+        every run. Reproduced on any OS by faking the platform and a home that
+        holds such a config, then checking nothing reaches the API."""
+        import json
+        import os
+        import tempfile
+        calls = []
+
+        def recorder(token, *args, **kwargs):
+            calls.append(token)
+            return {}
+
+        with tempfile.TemporaryDirectory() as host:
+            home = Path(host)
+            (home / ".config" / "claude-status").mkdir(parents=True)
+            (home / ".config" / "claude-status" / "config.json").write_text(
+                json.dumps({"providers": [{"id": "claude:b", "type": "claude"}]}),
+                encoding="utf-8")
+            (home / ".claude-b").mkdir()
+            (home / ".claude-b" / ".credentials.json").write_text(
+                json.dumps({"claudeAiOauth": {
+                    "accessToken": "SECOND-ACCOUNT-TOKEN",
+                    "expiresAt": (time.time() + 86400) * 1000}}),
+                encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HOME": host, "USERPROFILE": host}), \
+                    mock.patch.object(sys, "platform", "linux"):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                self._render_once(fetch=recorder)
+        self.assertEqual(calls, [], "the render run reached the contributor's second account")
 
 
 if __name__ == "__main__":

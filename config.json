@@ -23,12 +23,11 @@
     "cost": true,
     "model": true,
     "branch": true,
-    "heartbeat": true,
-    "activity": true,
+    "heartbeat": false,
     "update": true,
     "claude_update": true,
-    "opus": true,
-    "sonnet": true,
+    "opus": false,
+    "sonnet": false,
     "effort": true,
     "worktree": true,
     "pomodoro": true,
@@ -46,7 +45,7 @@
     "pace": false,
     "git_drift": false,
     "files_changed": false,
-    "fable": true,
+    "fable": false,
     "fast_mode": true,
     "thinking": false,
     "agent": true,
@@ -54,6 +53,16 @@
     "weekly_cost": false,
     "cache": false,
     "pr": false,
-    "lines": true
-  }
+    "lines": true,
+    "subagents": true,
+    "team": true,
+    "budget": true
+  },
+  "budget_usd": 0,
+  "limits": {
+    "subagent_spawns": 200,
+    "subagent_concurrent": 20,
+    "web_searches": 200
+  },
+  "providers": []
 }
